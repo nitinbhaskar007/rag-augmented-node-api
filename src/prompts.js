@@ -1,3 +1,30 @@
+// hree prompts:
+// ANSWER_INSTRUCTIONS
+
+// Forces the model:
+
+// only use provided context
+
+// if missing, say “I don’t know…”
+
+// cite sources in a consistent format
+
+// This prevents hallucinations.
+
+// MULTI_QUERY_INSTRUCTIONS
+
+// Forces output as valid JSON:
+
+// {"queries":["...","...","..."]}
+
+// HYDE_INSTRUCTIONS
+
+// Generates a hypothetical answer
+// Used only for retrieval embedding (not shown to user).
+
+// Interview line:
+// “We use prompt constraints to control model behavior and reduce hallucination risk.”
+
 export const ANSWER_INSTRUCTIONS = `
 You are a careful assistant. Answer ONLY using the provided CONTEXT.
 If the answer is not in the context, say: "I don't know from the provided documents."

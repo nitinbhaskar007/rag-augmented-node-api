@@ -1,6 +1,85 @@
+// This is the “brain” of your API.
+
+// Why engine exists
+
+// In server apps, we should:
+
+// load index once
+
+// reuse it for all requests
+
+// avoid re-reading and re-parsing on each call
+
+// What engine contains
+
+// Caches
+
+// Embeddings cache
+
+// Augmentation cache (rewrites & hyde)
+
+// Answer cache
+
+// Stored in .cache.json
+
+// Purpose:
+
+// avoid repeated embedding cost
+
+// faster responses
+
+// Error handling
+
+// classifyOpenAIError() decides:
+
+// insufficient_quota
+
+// rate_limit_exceeded
+
+// transient 5xx/timeouts
+
+// withRetry() does exponential backoff for transient + rate-limit errors
+
+// This gives a real production pattern.
+
+// Augmentation functions
+
+// getMultiQueriesCached()
+
+// getHydeCached()
+
+// If quota is missing, engine falls back to normal RAG (no augmentation).
+
+// Embedding function
+
+// embedTextsCached() embeds only cache misses
+
+// Diversity selection
+
+// pickDiverse() reduces duplicate context chunks
+
+// initRagEngine() factory
+// Loads:
+
+// vector store
+
+// caches
+
+// Returns:
+
+// ask(question) function
+
+// reloadStore() (for reindex)
+
+// What ask(question) returns
+// {
+//   answer: "...",
+//   sources: ["data/file#idx", ...],
+//   debug: {...optional}
+// }
+
 import fs from "node:fs/promises";
 import path from "node:path";
-
 import { client, dot } from "../lib.js";
 import { LocalVectorStore } from "../vectorStore.js";
 import { embedTexts } from "../embed.js";

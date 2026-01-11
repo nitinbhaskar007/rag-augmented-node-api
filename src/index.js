@@ -1,3 +1,6 @@
+// Just calls buildIndex().
+
+// This keeps your index build process separate from server runtime.
 import { buildIndex } from "./indexer.js";
 
 async function main() {

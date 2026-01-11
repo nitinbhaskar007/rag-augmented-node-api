@@ -1,3 +1,36 @@
+// What it does
+
+// Creates OpenAI client:
+
+// export const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Normalizes text:
+
+// replace Windows line breaks
+
+// remove extra spaces
+// This improves chunk quality + embedding consistency.
+
+// Chunking:
+
+// breaks doc into smaller chunks with overlap
+
+// overlap avoids losing meaning at chunk boundaries
+
+// Vector math:
+
+// dot, l2norm, normalizeVec
+
+// used for cosine similarity
+
+// JSON helpers:
+
+// saveJSON / loadJSON
+// These persist your local store and caches.
+
+// Interview line:
+// “lib.js is the foundational utilities module: input cleanup, chunking, vector math, file IO, and OpenAI client setup.”
+
 import "dotenv/config";
 import fs from "node:fs/promises";
 import path from "node:path";

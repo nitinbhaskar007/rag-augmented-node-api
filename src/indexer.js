@@ -1,3 +1,23 @@
+// What it does
+
+// This is your “ETL pipeline”:
+
+// load+chunk docs
+
+// batch embed chunks (e.g., 64 at a time)
+
+// save store to disk
+
+// Why batching matters:
+
+// API efficiency
+
+// less overhead
+
+// Why this file exists:
+
+// reused by /reindex endpoint too
+
 import { loadAndChunkDocs } from "./loadDocs.js";
 import { LocalVectorStore } from "./vectorStore.js";
 import { embedTexts } from "./embed.js";

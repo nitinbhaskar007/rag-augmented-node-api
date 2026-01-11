@@ -1,3 +1,28 @@
+// What it does
+
+// Finds files in data/**/*.txt|md
+
+// Reads them
+
+// Chunks each file
+
+// Converts into chunk objects:
+
+// {
+//   id: "data/policies.md#2",
+//   source: "data/policies.md",
+//   chunkIndex: 2,
+//   content: "text of chunk..."
+// }
+
+// Why this matters
+
+// Vectors don’t store “documents”, they store chunks.
+// RAG retrieval works best on chunk-level.
+
+// Interview line:
+// “Instead of embedding whole documents, we embed chunked passages to increase retrieval precision.”
+
 import fs from "node:fs/promises";
 import path from "node:path";
 import { glob } from "glob";

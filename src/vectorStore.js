@@ -1,5 +1,50 @@
-import { loadJSON, saveJSON, normalizeVec, dot } from "./lib.js";
+// What it stores
 
+// Each item includes:
+
+// chunk content
+
+// metadata
+
+// embedding vector (unit normalized)
+
+// Key functions
+// search(queryEmbeddingUnit, topK)
+
+// computes cosine similarity between query vector and each stored chunk vector
+
+// returns topK matches
+
+// Cosine similarity:
+
+// Since both vectors are normalized, cosine = dot product
+
+// Very fast and simple
+
+// searchMulti(queryEmbeddingUnits, perQueryTopK, finalTopK)
+
+// This is crucial for Augmented RAG.
+
+// You have multiple query embeddings:
+
+// original question embedding
+
+// multi-query embeddings
+
+// HyDE embedding
+
+// For each query, get top results
+
+// Merge results using Map() so duplicates are removed
+
+// Keep best score per chunk
+
+// Return final top list
+
+// Interview line:
+// “We do union retrieval across multiple query embeddings to improve recall and cover synonyms and alternate phrasing.”
+
+import { loadJSON, saveJSON, normalizeVec, dot } from "./lib.js";
 /**
  * LocalVectorStore
  * Stores: [{ id, source, chunkIndex, content, embeddingUnit }]

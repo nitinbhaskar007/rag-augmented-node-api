@@ -1,3 +1,39 @@
+// This wraps the engine in HTTP routes.
+
+// Key points
+// GET /health
+
+// Simple health check.
+
+// On startup:
+// const engine = await initRagEngine(...)
+
+// So index is loaded once.
+
+// POST /ask
+
+// validates input
+
+// calls engine.ask(question)
+
+// returns answer JSON
+
+// POST /reindex
+
+// protected endpoint
+
+// rebuilds index from docs using buildIndex
+
+// reloads store in engine
+
+// Security: RAG_API_KEY
+
+// If you set it in .env, server requires:
+
+// header x-api-key
+
+// If you don’t set it, no auth.
+
 import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";

@@ -1,3 +1,17 @@
+// What it does
+
+// Calls embeddings endpoint once with an array of text inputs
+
+// Returns normalized vectors (embeddingUnit)
+
+// This is used in:
+
+// indexing (embed chunks)
+
+// asking (embed queries)
+
+// Important: this is server-side only.
+
 import { client, normalizeText } from "./lib.js";
 import { toUnitEmbedding } from "./vectorStore.js";
 
