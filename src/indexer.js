@@ -18,29 +18,61 @@
 
 // reused by /reindex endpoint too
 
-import { loadAndChunkDocs } from "./loadDocs.js";
-import { LocalVectorStore } from "./vectorStore.js";
-import { embedTexts } from "./embed.js";
-import fs from "node:fs/promises";
+// This is your offline ingestion pipeline.
 
-/**
- * Build index from documents and save to index/store.json.
- * Exported so API can call it on /reindex.
- */
+// What it does
+
+// Calls loadAndChunkDocs() → gets chunk objects
+
+// Batches chunks (e.g., 64 at a time)
+
+// Calls embedTexts() → gets vectors
+
+// Creates LanceDB records:
+
+// { id, source, chunkIndex, content, vector }
+
+// Writes them into LanceDB table:
+
+// first batch → overwrite (fresh table)
+
+// next batches → add
+
+// Builds indexes (ensureIndexes())
+
+// Why it matters
+
+// You only run this when docs change.
+// It’s the “Load → Chunk → Embed → Store” flow in your slide.
+
+import { loadAndChunkDocs } from "./loadDocs.js";
+import { embedTexts } from "./embed.js";
+import { LanceVectorStore } from "./vectorStore.js";
+
 export async function buildIndex({
   dataDir = "data",
   exts = ["txt", "md"],
-  chunk = { maxChars: 1200, overlapChars: 200 },
-  indexPath = "index/store.json",
-  embedModel = process.env.RAG_EMBED_MODEL || "text-embedding-3-small",
+  chunk = { chunkSize: 1200, chunkOverlap: 200 },
   batchSize = 64,
   logger = console,
+  lanceUri = process.env.LANCEDB_URI || "./.lancedb",
+  tableName = process.env.LANCEDB_TABLE || "rag_chunks",
+  embedModel = process.env.RAG_EMBED_MODEL || "text-embedding-3-small",
+  vectorColumn = process.env.RAG_VECTOR_COLUMN || "vector",
+  ftsColumn = process.env.RAG_FTS_COLUMN || "content",
 } = {}) {
   logger.info?.("Indexing: loading + chunking docs...");
   const chunks = await loadAndChunkDocs({ dataDir, exts, chunk });
   logger.info?.(`Indexing: chunks = ${chunks.length}`);
 
-  const store = new LocalVectorStore([]);
+  const store = await LanceVectorStore.init({
+    uri: lanceUri,
+    tableName,
+    vectorColumn,
+    ftsColumn,
+  });
+
+  let created = false;
 
   for (let i = 0; i < chunks.length; i += batchSize) {
     const batch = chunks.slice(i, i + batchSize);
@@ -49,15 +81,21 @@ export async function buildIndex({
       { model: embedModel }
     );
 
-    batch.forEach((c, idx) => {
-      store.add({
-        id: c.id,
-        source: c.source,
-        chunkIndex: c.chunkIndex,
-        content: c.content,
-        embeddingUnit: vectors[idx],
-      });
-    });
+    const records = batch.map((c, idx) => ({
+      id: c.id,
+      source: c.source,
+      chunkIndex: c.chunkIndex,
+      content: c.content,
+      [vectorColumn]: vectors[idx],
+    }));
+
+    if (!created) {
+      logger.info?.("Indexing: creating table (overwrite)...");
+      await store.overwrite(records);
+      created = true;
+    } else {
+      await store.add(records);
+    }
 
     logger.info?.(
       `Indexing: embedded ${Math.min(i + batchSize, chunks.length)}/${
@@ -66,9 +104,12 @@ export async function buildIndex({
     );
   }
 
-  await fs.mkdir("index", { recursive: true });
-  await store.save(indexPath);
-  logger.info?.(`Indexing: ✅ saved ${indexPath}`);
+  // ✅ Build indexes: vector index + FTS(BM25) index
+  logger.info?.("Indexing: building vector + FTS indexes...");
+  await store.ensureIndexes();
 
-  return { store, chunksCount: chunks.length };
+  logger.info?.(
+    `Indexing: ✅ done. LanceDB uri=${lanceUri} table=${tableName}`
+  );
+  return { chunksCount: chunks.length };
 }

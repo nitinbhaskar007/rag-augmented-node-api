@@ -32,8 +32,52 @@
 
 // header x-api-key
 
-// If you don’t set it, no auth.
+// // If you don’t set it, no auth.
+// This is your web server entry.
 
+// What it does
+// A) Fastify setup
+
+// CORS enabled (so frontend can call)
+
+// rate limit enabled (to prevent abuse)
+
+// optional API key auth via x-api-key
+
+// B) Loads engine once at startup
+// const engine = await initRagEngine(...)
+
+// C) Routes
+
+// GET /health
+
+// simple “server is alive” check
+
+// POST /ask
+
+// validates input
+
+// passes question + filters to engine.ask()
+
+// returns answer + sources to frontend
+
+// POST /reindex (optional)
+
+// runs indexing pipeline again
+
+// reloads LanceDB table in engine
+
+// Why it matters
+
+// This file is what makes your RAG usable by frontend safely.
+
+// Quick “KT Summary” (best for interviews)
+
+// indexer.js + loadDocs.js + embed.js + vectorStore.js = offline ingestion pipeline
+
+// engine.js = online query pipeline (Augmented + Hybrid RAG)
+
+// server.js = REST wrapper for frontend
 import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
@@ -43,16 +87,35 @@ import { initRagEngine } from "./rag/engine.js";
 import { buildIndex } from "./indexer.js";
 
 const PORT = Number(process.env.PORT || 3001);
-const INDEX_PATH = process.env.RAG_INDEX_PATH || "index/store.json";
 const API_KEY = process.env.RAG_API_KEY || "";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || true;
 
 function requireApiKey(req, reply) {
   if (!API_KEY) return;
   const key = req.headers["x-api-key"];
-  if (key !== API_KEY) {
-    reply.code(401).send({ error: "Unauthorized" });
+  if (key !== API_KEY) reply.code(401).send({ error: "Unauthorized" });
+}
+
+function normalizeAskPayload(body) {
+  const question = body?.question;
+
+  // Optional filters
+  const filters =
+    body?.filters && typeof body.filters === "object"
+      ? body.filters
+      : undefined;
+
+  // Optional mustInclude keywords
+  let mustInclude = body?.mustInclude;
+  if (typeof mustInclude === "string") {
+    // allow "refund partial" convenience
+    mustInclude = mustInclude.split(/\s+/).filter(Boolean);
   }
+  if (!Array.isArray(mustInclude)) mustInclude = undefined;
+
+  const mustIncludeMode = body?.mustIncludeMode === "any" ? "any" : "all";
+
+  return { question, filters, mustInclude, mustIncludeMode };
 }
 
 async function main() {
@@ -67,21 +130,27 @@ async function main() {
     timeWindow: "1 minute",
   });
 
-  // Health check
   app.get("/health", async () => ({ ok: true }));
 
-  // Load engine once
   app.log.info("Loading RAG engine...");
-  const engine = await initRagEngine({
-    indexPath: INDEX_PATH,
-    log: app.log,
-  });
-  app.log.info(`RAG engine ready. Chunks loaded: ${engine.store.items.length}`);
+  const engine = await initRagEngine({ log: app.log });
+  app.log.info("RAG engine ready.");
 
-  // Main ask endpoint
+  /**
+   * POST /ask
+   * Body:
+   * {
+   *   question: string,
+   *   filters?: { sources?: string[], sourcePrefix?: string },
+   *   mustInclude?: string[] | "keyword keyword",
+   *   mustIncludeMode?: "all" | "any"
+   * }
+   */
   app.post("/ask", { preHandler: requireApiKey }, async (req, reply) => {
     try {
-      const { question } = req.body || {};
+      const { question, filters, mustInclude, mustIncludeMode } =
+        normalizeAskPayload(req.body);
+
       if (
         !question ||
         typeof question !== "string" ||
@@ -90,7 +159,12 @@ async function main() {
         return reply.code(400).send({ error: "question is required" });
       }
 
-      const result = await engine.ask(question.trim());
+      const result = await engine.ask(question.trim(), {
+        filters,
+        mustInclude,
+        mustIncludeMode,
+      });
+
       return reply.send(result);
     } catch (err) {
       req.log.error(err);
@@ -101,24 +175,15 @@ async function main() {
   });
 
   /**
-   * Optional: /reindex to rebuild index from data/
-   * Protected by x-api-key (if RAG_API_KEY is set).
+   * POST /reindex
+   * Protected by x-api-key (if RAG_API_KEY is set)
    */
   app.post("/reindex", { preHandler: requireApiKey }, async (req, reply) => {
     try {
       app.log.info("Reindex requested...");
-      await buildIndex({
-        dataDir: "data",
-        exts: ["txt", "md"],
-        chunk: { maxChars: 1200, overlapChars: 200 },
-        indexPath: INDEX_PATH,
-        logger: app.log,
-      });
-
-      const newCount = await engine.reloadStore();
-      app.log.info(`Reindex complete. Reloaded chunks: ${newCount}`);
-
-      return reply.send({ ok: true, chunks: newCount });
+      await buildIndex({ logger: app.log });
+      await engine.reloadStore();
+      return reply.send({ ok: true });
     } catch (err) {
       req.log.error(err);
       return reply

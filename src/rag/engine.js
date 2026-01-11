@@ -78,18 +78,92 @@
 //   debug: {...optional}
 // }
 
+// This is the most important file at runtime.
+
+// What it does (step-by-step)
+// A) Startup initialization
+
+// connects to LanceDB (vector store)
+
+// loads caches:
+
+// .cache/embeddings.json
+
+// .cache/augment.json
+
+// .cache/answers.json
+
+// ensures indexes exist (best effort)
+
+// B) Implements ask(question, options)
+
+// This function runs the full RAG pipeline:
+
+// 1) Augmentation (optional)
+
+// Multi-query rewrite (3 variants)
+
+// HyDE hypothetical answer
+
+// If quota is missing → skips augmentation safely
+
+// 2) Embedding
+
+// Embeds all query variants
+
+// Uses embedding cache to avoid re-embedding same text
+
+// 3) Retrieval
+
+// Hybrid retrieval: vector + BM25
+
+// Multi-variant retrieval: do it for each variant
+
+// Merge results across variants
+
+// 4) Filtering + must-include (if enabled)
+
+// filters by allowed sources/prefix
+
+// enforces keywords present in chunk text
+
+// 5) Diversity selection
+
+// picks top chunks but avoids near duplicates (MMR-ish)
+
+// 6) Context packing
+
+// builds prompt context with [source: ...]
+
+// 7) Answer generation
+
+// uses ANSWER_INSTRUCTIONS to keep output grounded
+
+// 8) Cache persistence
+
+// writes caches back to disk safely using a write queue
+
+// Why it matters
+
+// This is your “production-level RAG logic”, extracted cleanly so:
+
+// server can call it per request
+
+// you can test it separately
+
+// easy to explain in interviews
 import fs from "node:fs/promises";
 import path from "node:path";
 import { client, dot } from "../lib.js";
-import { LocalVectorStore } from "../vectorStore.js";
 import { embedTexts } from "../embed.js";
+import { LanceVectorStore } from "../vectorStore.js";
 import {
   ANSWER_INSTRUCTIONS,
   MULTI_QUERY_INSTRUCTIONS,
   HYDE_INSTRUCTIONS,
 } from "../prompts.js";
 
-/* ----------------------- Config ----------------------- */
+/* ---------------- Config ---------------- */
 const CACHE_DIR = ".cache";
 const EMBED_CACHE_PATH = path.join(CACHE_DIR, "embeddings.json");
 const AUGMENT_CACHE_PATH = path.join(CACHE_DIR, "augment.json");
@@ -107,7 +181,16 @@ const CONTEXT_K = Number(process.env.RAG_CONTEXT_K || 6);
 
 const DEBUG = (process.env.RAG_DEBUG ?? "false") === "true";
 
-/* ----------------------- Cache helpers ----------------------- */
+// Hybrid toggle
+const ENABLE_HYBRID = (process.env.RAG_HYBRID ?? "true") === "true";
+const RRF_K = Number(process.env.RAG_RRF_K || 60);
+
+const LANCEDB_URI = process.env.LANCEDB_URI || "./.lancedb";
+const LANCEDB_TABLE = process.env.LANCEDB_TABLE || "rag_chunks";
+const VECTOR_COLUMN = process.env.RAG_VECTOR_COLUMN || "vector";
+const FTS_COLUMN = process.env.RAG_FTS_COLUMN || "content";
+
+/* ---------------- Cache helpers ---------------- */
 function hashKey(s) {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -141,25 +224,24 @@ async function writeJson(filePath, obj) {
   await fs.writeFile(filePath, JSON.stringify(obj, null, 2), "utf-8");
 }
 
-/* ----------------------- Error handling ----------------------- */
+/* ---------------- Error handling ---------------- */
 function classifyOpenAIError(err) {
   const status = err?.status;
   const code = err?.code || err?.error?.code;
-  const message = (err?.message || err?.error?.message || "").toLowerCase();
+  const msg = (err?.message || err?.error?.message || "").toLowerCase();
 
   const isQuota =
-    status === 429 &&
-    (code === "insufficient_quota" || message.includes("quota"));
+    status === 429 && (code === "insufficient_quota" || msg.includes("quota"));
   const isRateLimit =
     status === 429 &&
     (code === "rate_limit_exceeded" ||
-      message.includes("rate limit") ||
-      message.includes("too many requests"));
+      msg.includes("rate limit") ||
+      msg.includes("too many requests"));
 
   const isTransient =
     (status >= 500 && status <= 599) ||
-    message.includes("timeout") ||
-    message.includes("temporarily");
+    msg.includes("timeout") ||
+    msg.includes("temporarily");
 
   return { status, code, isQuota, isRateLimit, isTransient };
 }
@@ -174,8 +256,6 @@ async function withRetry(
       return await fn();
     } catch (err) {
       const info = classifyOpenAIError(err);
-
-      // Quota never succeeds by retry
       if (info.isQuota) throw err;
 
       const canRetry = info.isRateLimit || info.isTransient;
@@ -189,17 +269,13 @@ async function withRetry(
         status: info.status,
         code: info.code,
       });
-
       await new Promise((r) => setTimeout(r, backoffMs));
       attempt++;
     }
   }
 }
 
-/* ----------------------- Diversity selection (MMR-ish) ----------------------- */
-/**
- * KT-friendly: picks top chunks but avoids near-duplicates in context.
- */
+/* ---------------- Diversity selection (MMR-ish) ---------------- */
 function pickDiverse(
   hits,
   { k = CONTEXT_K, lambda = 0.8, minKeep = 0.1 } = {}
@@ -212,7 +288,7 @@ function pickDiverse(
 
     let maxSimToPicked = 0;
     for (const pe of pickedEmbeds) {
-      const sim = dot(h.item.embeddingUnit, pe); // cosine (unit vectors)
+      const sim = dot(h.item.embeddingUnit, pe);
       if (sim > maxSimToPicked) maxSimToPicked = sim;
     }
 
@@ -223,7 +299,6 @@ function pickDiverse(
       pickedEmbeds.push(h.item.embeddingUnit);
     }
   }
-
   return picked;
 }
 
@@ -236,7 +311,59 @@ function buildContextBlock(selectedHits) {
     .join("\n\n---\n\n");
 }
 
-/* ----------------------- Cached augmentation ----------------------- */
+/* ---------------- Filtering helpers ---------------- */
+
+/**
+ * filters:
+ * {
+ *   sources?: string[]        // allow-list of sources
+ *   sourcePrefix?: string     // allow sources starting with prefix
+ * }
+ */
+function applySourceFilters(hits, filters) {
+  if (!filters) return hits;
+
+  const allowSources = Array.isArray(filters.sources)
+    ? new Set(filters.sources)
+    : null;
+  const prefix =
+    typeof filters.sourcePrefix === "string" ? filters.sourcePrefix : null;
+
+  return hits.filter((h) => {
+    const src = h.item.source;
+
+    if (allowSources && !allowSources.has(src)) return false;
+    if (prefix && !src.startsWith(prefix)) return false;
+
+    return true;
+  });
+}
+
+/**
+ * mustInclude: string[] keywords
+ * mode: "all" | "any"
+ *
+ * Applies AFTER retrieval.
+ * We retrieve extra candidates first so filtering doesn't kill recall.
+ */
+function applyMustInclude(hits, mustInclude, mode = "all") {
+  if (!Array.isArray(mustInclude) || mustInclude.length === 0) return hits;
+
+  const kws = mustInclude.map((k) => String(k).toLowerCase()).filter(Boolean);
+  if (kws.length === 0) return hits;
+
+  return hits.filter((h) => {
+    const text = (h.item.content || "").toLowerCase();
+
+    if (mode === "any") {
+      return kws.some((k) => text.includes(k));
+    }
+    // default: "all"
+    return kws.every((k) => text.includes(k));
+  });
+}
+
+/* ---------------- Cached augmentation ---------------- */
 async function getMultiQueriesCached(question, augmentCache, log) {
   const key = `mq:${GEN_MODEL}:${hashKey(question)}`;
   if (augmentCache[key]) return augmentCache[key];
@@ -285,7 +412,7 @@ async function getHydeCached(question, augmentCache, log) {
   return hyde;
 }
 
-/* ----------------------- Cached embeddings ----------------------- */
+/* ---------------- Cached embeddings ---------------- */
 async function embedTextsCached(texts, embedCache, log) {
   const keys = texts.map((t) => `emb:${EMBED_MODEL}:${hashKey(t)}`);
   const misses = [];
@@ -305,14 +432,14 @@ async function embedTextsCached(texts, embedCache, log) {
     );
 
     vectors.forEach((v, j) => {
-      embedCache[keys[missIndexes[j]]] = v; // unit vectors
+      embedCache[keys[missIndexes[j]]] = v;
     });
   }
 
   return keys.map((k) => embedCache[k]);
 }
 
-/* ----------------------- Cached answering ----------------------- */
+/* ---------------- Cached answering ---------------- */
 async function answerWithContextCached(question, context, answerCache, log) {
   const key = `ans:${GEN_MODEL}:${hashKey(question)}:${hashKey(context)}`;
   if (answerCache[key]) return answerCache[key];
@@ -333,17 +460,20 @@ async function answerWithContextCached(question, context, answerCache, log) {
   return out;
 }
 
-/* ----------------------- Engine factory ----------------------- */
-/**
- * initRagEngine()
- * - loads store + caches once
- * - returns { ask(), reloadStore() }
- */
-export async function initRagEngine({ indexPath, log = console } = {}) {
-  // Load index
-  let store = await LocalVectorStore.load(indexPath);
+/* ---------------- Engine factory ---------------- */
+export async function initRagEngine({ log = console } = {}) {
+  const store = await LanceVectorStore.init({
+    uri: LANCEDB_URI,
+    tableName: LANCEDB_TABLE,
+    vectorColumn: VECTOR_COLUMN,
+    ftsColumn: FTS_COLUMN,
+  });
 
-  // Load caches
+  // best-effort index creation (safe if already exists)
+  try {
+    await store.ensureIndexes();
+  } catch {}
+
   const embedCache = await readJsonSafe(EMBED_CACHE_PATH, {});
   const augmentCache = await readJsonSafe(AUGMENT_CACHE_PATH, {});
   const answerCache = await readJsonSafe(ANSWER_CACHE_PATH, {});
@@ -357,21 +487,24 @@ export async function initRagEngine({ indexPath, log = console } = {}) {
   }
 
   return {
-    get store() {
-      return store;
-    },
+    store,
 
     async reloadStore() {
-      store = await LocalVectorStore.load(indexPath);
-      return store.items.length;
+      await store.reload();
     },
 
     /**
-     * ask(question)
-     * Returns: { answer, sources, debug? }
+     * ask(question, options?)
+     * options:
+     * {
+     *   filters?: { sources?: string[], sourcePrefix?: string }
+     *   mustInclude?: string[]
+     *   mustIncludeMode?: "all" | "any"
+     * }
      */
-    async ask(question) {
+    async ask(question, options = {}) {
       const started = Date.now();
+      const { filters, mustInclude, mustIncludeMode = "all" } = options;
 
       // 1) Augment query (best-effort)
       let rewrites = [];
@@ -385,7 +518,6 @@ export async function initRagEngine({ indexPath, log = console } = {}) {
       } catch (err) {
         const info = classifyOpenAIError(err);
         if (info.isQuota) {
-          // If quota missing, continue without augmentation
           log.warn?.(
             "No quota for augmentation; continuing without rewrites/HyDE.",
             { code: info.code }
@@ -397,9 +529,10 @@ export async function initRagEngine({ indexPath, log = console } = {}) {
         }
       }
 
+      // Keep texts aligned with embeddings
       const variantTexts = [question, ...rewrites, hyde].filter(Boolean);
 
-      // 2) Embed query variants (required)
+      // 2) Embed query variants
       let variantEmbeds;
       try {
         variantEmbeds = await embedTextsCached(variantTexts, embedCache, log);
@@ -415,19 +548,65 @@ export async function initRagEngine({ indexPath, log = console } = {}) {
         throw err;
       }
 
-      // 3) Retrieve candidates
-      const mergedHits = store.searchMulti(variantEmbeds, {
-        perQueryTopK: PER_QUERY_TOPK,
-        finalTopK: FINAL_TOPK,
-      });
+      // 3) Retrieve MORE candidates first (important for filtering)
+      const expandedFinalTopK = Math.max(FINAL_TOPK * 4, FINAL_TOPK);
+      const expandedPerQueryTopK = Math.max(PER_QUERY_TOPK * 3, PER_QUERY_TOPK);
 
-      // 4) Pick diverse top chunks
-      const selected = pickDiverse(mergedHits, { k: CONTEXT_K, lambda: 0.8 });
+      let mergedHits;
+      if (ENABLE_HYBRID) {
+        mergedHits = await store.hybridSearchMulti(
+          variantEmbeds,
+          variantTexts,
+          {
+            perQueryTopK: expandedPerQueryTopK,
+            finalTopK: expandedFinalTopK,
+            rrfK: RRF_K,
+          }
+        );
+      } else {
+        // If you ever disable hybrid, you can add vector-only search here
+        mergedHits = await store.hybridSearchMulti(
+          variantEmbeds,
+          variantTexts,
+          {
+            perQueryTopK: expandedPerQueryTopK,
+            finalTopK: expandedFinalTopK,
+            rrfK: RRF_K,
+          }
+        );
+      }
 
-      // 5) Build context
+      // 4) Apply Filters + Must-Include keywords
+      let filtered = applySourceFilters(mergedHits, filters);
+      filtered = applyMustInclude(filtered, mustInclude, mustIncludeMode);
+
+      // If filters are too strict, you may end up with 0 chunks
+      if (filtered.length === 0) {
+        return {
+          answer:
+            "I couldn't find relevant passages that match your filters/keywords in the provided documents.",
+          sources: [],
+          debug: DEBUG
+            ? {
+                hybrid: ENABLE_HYBRID,
+                filters,
+                mustInclude,
+                mustIncludeMode,
+                retrievedCandidates: mergedHits.length,
+                afterFiltering: 0,
+                durationMs: Date.now() - started,
+              }
+            : undefined,
+        };
+      }
+
+      // 5) Diversity select from filtered hits
+      const selected = pickDiverse(filtered, { k: CONTEXT_K });
+
+      // 6) Context
       const context = buildContextBlock(selected);
 
-      // 6) Answer
+      // 7) Answer
       let answer;
       try {
         answer = await answerWithContextCached(
@@ -448,7 +627,6 @@ export async function initRagEngine({ indexPath, log = console } = {}) {
         throw err;
       }
 
-      // 7) Persist caches (safe, serialized)
       await persistCaches();
 
       const durationMs = Date.now() - started;
@@ -458,9 +636,15 @@ export async function initRagEngine({ indexPath, log = console } = {}) {
         sources: selected.map((h) => h.item.id),
         debug: DEBUG
           ? {
+              hybrid: ENABLE_HYBRID,
+              rrfK: RRF_K,
+              filters,
+              mustInclude,
+              mustIncludeMode,
               rewrites,
               hydeUsed: Boolean(hyde),
               retrievedCandidates: mergedHits.length,
+              afterFiltering: filtered.length,
               contextChunks: selected.length,
               durationMs,
             }
