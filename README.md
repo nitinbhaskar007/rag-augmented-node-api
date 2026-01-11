@@ -1,352 +1,285 @@
 ```md
 # RAG + Hybrid Search API (Node.js + OpenAI + LanceDB)
 
-This project is a **backend RAG (Retrieval Augmented Generation) API** that answers user questions using your own documents.
-
-It has **two pipelines**:
-
-1. **Indexing pipeline** (offline / when docs change)
-2. **Query pipeline** (online / per API request)
+A production-style **Retrieval Augmented Generation (RAG)** backend built with **Node.js**, **OpenAI SDK**, and **LanceDB** (VectorDB).  
+It exposes a clean **REST API** (`POST /ask`) that your frontend can call to get answers grounded in your documents.
 
 ---
 
-## What problems this solves
+## Table of Contents
 
-- Keeps your **OpenAI API key safe** (server-side only)
-- Lets your **frontend call your own API** (`POST /ask`)
-- Uses:
-  - **OpenAI Embeddings** to represent text as vectors
-  - **LanceDB** as a real **VectorDB**
-  - **Hybrid retrieval**: _semantic vector search + keyword BM25_
-  - **RRF fusion** (rank fusion) to merge vector + keyword results
-  - **Augmented RAG**: multi-query rewrites + HyDE to improve recall
-  - **Caching** to reduce cost and speed up repeat queries
+- [What this project does](#what-this-project-does)
+- [Architecture](#architecture)
+  - [Indexing pipeline](#indexing-pipeline)
+  - [Query pipeline](#query-pipeline)
+- [Tech stack](#tech-stack)
+- [Project structure](#project-structure)
+- [Setup](#setup)
+- [Environment variables](#environment-variables)
+- [How to run](#how-to-run)
+  - [1) Index documents](#1-index-documents)
+  - [2) Start the API server](#2-start-the-api-server)
+- [API Reference](#api-reference)
+  - [GET /health](#get-health)
+  - [POST /ask](#post-ask)
+  - [POST /reindex](#post-reindex)
+- [Hybrid Search explained (Vector + BM25)](#hybrid-search-explained-vector--bm25)
+- [Augmented RAG explained (Multi-query + HyDE)](#augmented-rag-explained-multi-query--hyde)
+- [Filters and Must-Include Keywords](#filters-and-must-include-keywords)
+- [Caching](#caching)
+- [Security notes](#security-notes)
+- [Troubleshooting](#troubleshooting)
+- [Interview-ready summary](#interview-ready-summary)
 
 ---
 
-## Folder structure
+## What this project does
+
+- Ingests documents from `data/`
+- Splits them into chunks (recursive splitting + overlap)
+- Embeds chunks using OpenAI embeddings
+- Stores embeddings in **LanceDB** (VectorDB) with:
+  - vector index for semantic search
+  - BM25/FTS index for keyword search
+- Answers questions via API by retrieving relevant chunks and calling an LLM with **context-only** instructions
+
+---
+
+## Architecture
+
+### Indexing pipeline
+
+Runs when documents change:
+
+1. **Load** raw documents from `data/`
+2. **Chunk** using recursive splitting + overlap
+3. **Embed** chunks using OpenAI embeddings
+4. **Store** into LanceDB table + create indexes
+
+**Flow**
 ```
 
-data/ # raw documents (.md/.txt)
+data/\* → chunking → embeddings → LanceDB table + indexes
+
+```
+
+### Query pipeline
+
+Runs per API request (`POST /ask`):
+
+1. (Optional) **Augment** the query (Multi-query + HyDE)
+2. **Embed** query variants (cached)
+3. **Retrieve** from LanceDB using hybrid search:
+   - vector semantic search
+   - BM25 keyword search
+   - fuse with RRF
+4. Apply (optional) **filters** and **mustInclude** constraints
+5. Select diverse context chunks (MMR-like)
+6. **Generate answer** using LLM with context-only prompt
+7. Return `{ answer, sources, debug? }`
+
+**Flow**
+```
+
+question → augmentation → embeddings → hybrid retrieval → constraints → answer
+
+```
+
+---
+
+## Tech stack
+
+- **Node.js** (ESM)
+- **OpenAI SDK**
+  - Embeddings: `text-embedding-3-small`
+  - Generation: configurable (default: `gpt-4.1-mini`)
+- **LanceDB** (VectorDB)
+  - Vector ANN index
+  - FTS/BM25 index
+- **Fastify**
+  - CORS
+  - rate limiting
+
+---
+
+## Project structure
+
+```
+
+data/ # raw docs (.md/.txt)
 src/
-lib.js # utilities, recursive chunking, vector math, OpenAI client
-loadDocs.js # load + chunk documents from data/
-prompts.js # prompt templates (answer, multi-query, hyde)
-embed.js # embeddings API wrapper
+lib.js # OpenAI client, recursive chunking, vector math, helpers
+loadDocs.js # load + chunk docs into chunk objects
+prompts.js # prompts: answer / multi-query / hyde
+embed.js # embeddings wrapper (returns unit vectors)
 vectorStore.js # LanceDB wrapper (vector + FTS + hybrid + RRF)
-indexer.js # indexing pipeline (docs -> vectors -> LanceDB)
-index.js # CLI entry to buildIndex()
-rag/engine.js # query pipeline (augment -> embed -> retrieve -> answer)
-server.js # Fastify REST API
-.cache/ # runtime caches (embeddings/augment/answers)
-.lancedb/ # LanceDB database files (VectorDB storage)
+indexer.js # indexing pipeline (docs → embeddings → LanceDB)
+index.js # CLI: rebuild index
+rag/
+engine.js # query pipeline (augment → embed → retrieve → answer)
+server.js # REST API server (Fastify)
+.cache/ # runtime caches (created automatically)
+.lancedb/ # LanceDB storage (created automatically)
 
 ````
+
+---
+
+## Setup
+
+### Install dependencies
+```bash
+npm install
+````
+
+### Add documents
+
+Put `.md` / `.txt` files into `data/`, e.g.
+
+```
+data/policies.md
+data/faq.txt
+```
+
+### Create `.env`
+
+Copy `.env.example` to `.env` and set required values:
+
+```bash
+cp .env.example .env
+```
 
 ---
 
 ## Environment variables
 
-Create `.env` from `.env.example`:
+### Required
 
-- `OPENAI_API_KEY` (required)
-- `PORT` (default 3001)
-- `CORS_ORIGIN` (frontend origin)
-- `RAG_API_KEY` (optional: protects /ask and /reindex)
-- `RAG_GEN_MODEL` (LLM for generation/augmentation)
-- `RAG_EMBED_MODEL` (embedding model)
-- `LANCEDB_URI` (default `./.lancedb`)
-- `LANCEDB_TABLE` (default `rag_chunks`)
-- Hybrid settings:
-  - `RAG_HYBRID=true`
-  - `RAG_RRF_K=60`
+- `OPENAI_API_KEY`
+  Your OpenAI API key (server-side only).
 
----
+### Server
 
-## Indexing pipeline (Load → Chunk → Embed → Store)
+- `PORT` (default: `3001`)
+- `CORS_ORIGIN` (example: `http://localhost:5173`)
 
-You run this when documents change:
+### Optional API protection
 
-```bash
-npm run index
-````
+- `RAG_API_KEY`
+  If set, server requires header `x-api-key` for `/ask` and `/reindex`.
 
-### Indexing steps
+### Models
 
-1. **Load docs**
+- `RAG_GEN_MODEL` (default: `gpt-4.1-mini`)
+- `RAG_EMBED_MODEL` (default: `text-embedding-3-small`)
 
-   - `src/loadDocs.js` reads `data/**/*.md|txt`
+### VectorDB (LanceDB)
 
-2. **Chunk docs (Recursive Text Splitting)**
+- `LANCEDB_URI` (default: `./.lancedb`)
+- `LANCEDB_TABLE` (default: `rag_chunks`)
 
-   - `src/lib.js` `chunkTextRecursive()`
-   - Separators priority:
+### Retrieval tuning
 
-     - `\n\n` (paragraphs)
-     - `\n` (lines)
-     - `" "` (spaces)
-     - `""` (characters fallback)
+- `RAG_PER_QUERY_TOPK` (default: `8`)
+- `RAG_FINAL_TOPK` (default: `25`)
+- `RAG_CONTEXT_K` (default: `6`)
 
-   - Final chunks are merged with:
+### Augmentation
 
-     - `chunkSize`
-     - `chunkOverlap`
+- `RAG_MULTI_QUERY=true|false`
+- `RAG_HYDE=true|false`
 
-3. **Embed chunks**
+### Hybrid Search
 
-   - `src/embed.js` calls OpenAI embeddings
-   - Embeddings are normalized to **unit vectors**
+- `RAG_HYBRID=true|false`
+- `RAG_RRF_K` (default: `60`)
+- `RAG_FTS_COLUMN` (default: `content`)
+- `RAG_VECTOR_COLUMN` (default: `vector`)
 
-4. **Store in VectorDB**
+### Debug
 
-   - `src/vectorStore.js` writes rows to LanceDB:
-
-     ```json
-     { "id": "...", "source": "...", "chunkIndex": 0, "content": "...", "vector": [..] }
-     ```
-
-5. **Build indexes**
-
-   - Vector ANN index (fast nearest-neighbor)
-   - FTS (BM25) index for keyword search
-
-### Indexing diagram
-
-```
-data/*.md/.txt
-   ↓ loadDocs.js
-chunks[{id, source, chunkIndex, content}]
-   ↓ embed.js (OpenAI embeddings)
-chunks + vectors
-   ↓ vectorStore.js (LanceDB)
-LanceDB table: rag_chunks
-   + Vector index
-   + FTS/BM25 index
-```
-
----
-
-## Query pipeline (API request: POST /ask)
-
-Frontend sends:
-
-```json
-{
-  "question": "What is the refund policy?",
-  "filters": { "sources": ["data/policies.md"] },
-  "mustInclude": ["refund", "partial"],
-  "mustIncludeMode": "all"
-}
-```
-
-Backend returns:
-
-```json
-{
-  "answer": "...",
-  "sources": ["data/policies.md#2", "data/faq.txt#0"],
-  "debug": { ... } // only when RAG_DEBUG=true
-}
-```
-
-### Query steps (per request)
-
-1. **Augment (optional, improves recall)**
-
-   - Multi-query rewrite: creates 3 short search queries
-   - HyDE: creates a short hypothetical answer used for retrieval embedding
-
-2. **Embed question variants**
-
-   - Variant texts: `[question, rewrite1, rewrite2, rewrite3, hyde]`
-   - Cached in `.cache/embeddings.json` by `(model + text hash)`
-
-3. **Retrieve from LanceDB**
-
-   - **Vector search**: semantic similarity
-   - **FTS/BM25 search**: keyword matching
-   - **Hybrid**: merges vector + BM25 results using **RRF (Reciprocal Rank Fusion)**
-
-4. **Merge across variants**
-
-   - Runs hybrid retrieval for each variant and merges best hits
-
-5. **Apply enterprise constraints**
-
-   - `filters`:
-
-     - allow only certain files (`sources`)
-     - or allow prefix (`sourcePrefix`)
-
-   - `mustInclude`:
-
-     - enforce that retrieved lookups contain required keywords
-     - mode:
-
-       - `all` (default): must contain all keywords
-       - `any`: must contain at least one keyword
-
-6. **Diversity selection (MMR-ish)**
-
-   - Avoids sending 6 near-duplicate chunks to the LLM
-   - Improves context coverage and reduces token waste
-
-7. **Answer using context only**
-
-   - Builds context block:
-
-     ```
-     [source: data/policies.md#2]
-     chunk text...
-
-     ---
-     [source: data/faq.txt#0]
-     chunk text...
-     ```
-
-   - Sends to LLM with strict instructions:
-
-     - Use ONLY provided context
-     - If not found: say "I don't know from the provided documents."
-
-8. **Cache writes**
-
-   - Embeddings cache
-   - Augment cache (rewrites/HyDE)
-   - Answer cache (question + context hash)
-
-### Query diagram
-
-```
-POST /ask (question)
-   ↓ engine.js
-[optional] Multi-query + HyDE
-   ↓ embed variants (cached)
-Vectors + query texts
-   ↓ vectorStore.js
-Vector Search + BM25 Search
-   ↓ RRF fusion (hybrid)
-Merged candidates
-   ↓ filters + mustInclude
-Filtered candidates
-   ↓ diversity selection
-Top context chunks
-   ↓ LLM answer (context-only)
-Response { answer, sources }
-```
-
----
-
-## Caching strategy
-
-Caches live in `.cache/`:
-
-- `embeddings.json`
-
-  - key: `emb:<model>:<hash(text)>`
-  - value: normalized embedding vector (float array)
-
-- `augment.json`
-
-  - key: `mq:<model>:<hash(question)>` → rewrites
-  - key: `hyde:<model>:<hash(question)>` → hyde text
-
-- `answers.json`
-
-  - key: `ans:<model>:<hash(question)>:<hash(context)>` → final answer
-
-Why cache helps:
-
-- Repeat questions become fast + cheaper
-- Multi-query and HyDE are reused instead of re-generated
-
----
-
-## Hybrid Retrieval (Vector + BM25) + RRF
-
-- **Vector search** finds semantically similar chunks (meaning)
-- **BM25/FTS** finds exact keyword matches (terms)
-
-RRF merges both ranked lists:
-
-For each list:
-
-- Rank starts at 1
-- Add: `1 / (K + rank)` to the document’s fusion score
-
-Where:
-
-- `K` (commonly 60) controls how strongly top ranks dominate
-
-Benefits:
-
-- Great for real enterprise docs where some queries require exact words (BM25) and some require meaning (vectors)
-
----
-
-## REST API
-
-### `GET /health`
-
-Returns `{ ok: true }`
-
-### `POST /ask`
-
-Body:
-
-```json
-{
-  "question": "string",
-  "filters": { "sources": ["..."], "sourcePrefix": "..." },
-  "mustInclude": ["keyword1", "keyword2"],
-  "mustIncludeMode": "all" | "any"
-}
-```
-
-### `POST /reindex` (optional)
-
-Rebuilds LanceDB table from `data/` and reloads engine.
-
-**Protect these endpoints** using `RAG_API_KEY`:
-
-- Send header: `x-api-key: <your key>`
-
----
-
-## Security notes (important)
-
-- Do NOT call OpenAI from frontend (never expose `OPENAI_API_KEY`)
-- `RAG_API_KEY` is your backend-only shared secret (ok for internal apps)
-- For public apps:
-
-  - don’t rely on static API keys in client bundles
-  - use user auth (JWT/session) and server-side authorization
+- `RAG_DEBUG=true|false`
 
 ---
 
 ## How to run
 
-1. Install
+### 1) Index documents
 
-```bash
-npm install
-```
-
-2. Put docs in `data/`
-
-3. Build index (writes to LanceDB)
+This builds the LanceDB table and indexes:
 
 ```bash
 npm run index
 ```
 
-4. Start API
+### 2) Start the API server
 
 ```bash
 npm run serve
 ```
 
-5. Test
+Server runs on:
+
+```
+http://localhost:3001
+```
+
+---
+
+## API Reference
+
+### GET /health
+
+**Response**
+
+```json
+{ "ok": true }
+```
+
+---
+
+### POST /ask
+
+**Request body**
+
+```json
+{
+  "question": "What is our refund policy?",
+  "filters": {
+    "sources": ["data/policies.md", "data/faq.txt"],
+    "sourcePrefix": "data/"
+  },
+  "mustInclude": ["refund", "partial"],
+  "mustIncludeMode": "all"
+}
+```
+
+**Fields**
+
+- `question` (required): string
+- `filters` (optional):
+
+  - `sources`: allow-list of exact source filenames
+  - `sourcePrefix`: allow only sources that start with prefix
+
+- `mustInclude` (optional): array of keywords (or a single space-separated string)
+- `mustIncludeMode` (optional): `"all"` (default) or `"any"`
+
+**Response**
+
+```json
+{
+  "answer": "....",
+  "sources": ["data/policies.md#2", "data/faq.txt#0"],
+  "debug": {
+    "hybrid": true,
+    "rrfK": 60,
+    "contextChunks": 6
+  }
+}
+```
+
+**cURL example**
 
 ```bash
 curl -X POST http://localhost:3001/ask \
@@ -354,28 +287,164 @@ curl -X POST http://localhost:3001/ask \
   -d "{\"question\":\"What is our refund policy?\"}"
 ```
 
----
+If `RAG_API_KEY` is set:
 
-## Deployment tips (simple)
-
-- Keep these folders persistent:
-
-  - `./.lancedb` (vector DB storage)
-  - `./.cache` (optional but helpful)
-
-- Typical hosting:
-
-  - VM (EC2 / DigitalOcean) → best for persistent disk
-  - Container → mount volumes for `.lancedb` and `.cache`
-
-- Add:
-
-  - reverse proxy (Nginx) in front
-  - HTTPS
-  - stronger auth if public
+```bash
+curl -X POST http://localhost:3001/ask \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_SECRET" \
+  -d "{\"question\":\"What is our refund policy?\"}"
+```
 
 ---
 
-## Interview-ready explanation (30 seconds)
+### POST /reindex
 
-“I built a Node.js RAG API. I ingest local docs, recursively chunk with overlap, embed chunks using OpenAI, and store them in LanceDB as a vector database with both vector and BM25 indexes. At query time, I augment the user question with rewrites and HyDE, embed variants, run hybrid retrieval (vector + BM25) fused by RRF, enforce filters and keyword constraints, diversify chunks using an MMR-like strategy, and generate a context-grounded answer with citations. Everything is exposed via Fastify so the frontend never sees the OpenAI key.”
+Rebuilds the index from `data/` and reloads the VectorDB table.
+
+**cURL**
+
+```bash
+curl -X POST http://localhost:3001/reindex \
+  -H "x-api-key: YOUR_SECRET"
+```
+
+---
+
+## Hybrid Search explained (Vector + BM25)
+
+Hybrid search improves retrieval quality by combining:
+
+- **Vector semantic search** (meaning-based)
+- **BM25 keyword search** (exact term matching)
+
+We fuse results using **RRF (Reciprocal Rank Fusion)**:
+
+- each list gives a rank to a chunk
+- fusion score adds:
+
+  ```
+  1 / (K + rank)
+  ```
+
+- `K` defaults to `60`
+
+Why it helps:
+
+- vector search handles synonyms and paraphrasing
+- BM25 handles exact keywords, IDs, and legal/policy language
+
+---
+
+## Augmented RAG explained (Multi-query + HyDE)
+
+Augmentation improves retrieval recall:
+
+1. **Multi-query rewrites**
+
+- LLM generates 3 alternate search queries
+
+2. **HyDE**
+
+- LLM generates a short hypothetical answer
+- embedding this answer often retrieves more relevant passages for abstract questions
+
+These are used only for retrieval; the final answer is still generated from retrieved context.
+
+---
+
+## Filters and Must-Include Keywords
+
+### Filters
+
+Use `filters.sources` to limit retrieval to specific docs:
+
+```json
+{ "filters": { "sources": ["data/policies.md"] } }
+```
+
+Use `filters.sourcePrefix` to limit by folder/prefix:
+
+```json
+{ "filters": { "sourcePrefix": "data/legal/" } }
+```
+
+### Must-include keywords
+
+Enforce required terms in retrieved chunks:
+
+```json
+{ "mustInclude": ["refund", "partial"], "mustIncludeMode": "all" }
+```
+
+- `"all"`: chunk must contain all keywords
+- `"any"`: chunk must contain at least one keyword
+
+---
+
+## Caching
+
+Caches are stored in `.cache/`:
+
+- `embeddings.json`
+  Caches embeddings for query texts (saves cost).
+
+- `augment.json`
+  Caches multi-query rewrites and HyDE output.
+
+- `answers.json`
+  Caches final answers keyed by `(question + context hash)`.
+
+Tip: keep `.cache/` persistent in production for best speed/cost.
+
+---
+
+## Security notes
+
+- Never expose `OPENAI_API_KEY` to the frontend.
+- `RAG_API_KEY` is OK for internal apps, but for public apps:
+
+  - use proper user authentication (JWT/session)
+  - apply authorization and abuse protection
+
+---
+
+## Troubleshooting
+
+### 1) `429 insufficient_quota`
+
+Your API project has no credits / billing not enabled.
+
+- Add credits in OpenAI billing
+- Confirm the correct Project/API key is used
+
+### 2) ESM warning / import issues
+
+Ensure `package.json` includes:
+
+```json
+"type": "module"
+```
+
+### 3) Hybrid search returns weak results
+
+- Re-run `npm run index` to rebuild FTS index
+- Check your docs/chunk settings (chunkSize/overlap)
+
+### 4) CORS errors in frontend
+
+Set `CORS_ORIGIN` to your frontend URL, e.g.:
+
+```
+CORS_ORIGIN=http://localhost:5173
+```
+
+---
+
+## Interview-ready summary
+
+“I built a Node.js RAG API that ingests documents, recursively chunks them with overlap, embeds each chunk using OpenAI embeddings, and stores vectors in LanceDB with both vector and BM25 indexes. At query time, I augment the question with multi-query rewrites and HyDE, embed variants, retrieve using hybrid search fused via RRF, apply optional constraints (source filters and must-include keywords), diversify context chunks with an MMR-like method, and generate a context-grounded answer with citations. The whole pipeline is exposed through a Fastify REST API so the frontend never touches the OpenAI key.”
+
+```
+::contentReference[oaicite:0]{index=0}
+```
