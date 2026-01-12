@@ -4,11 +4,14 @@
 import { buildIndex } from "./indexer.js";
 
 async function main() {
+  const modeArg = process.argv.find((x) => x.startsWith("--mode="));
+  const mode = modeArg ? modeArg.split("=")[1] : "incremental";
+
   await buildIndex({
+    mode,
     dataDir: "data",
     exts: ["txt", "md"],
-    chunk: { maxChars: 1200, overlapChars: 200 },
-    indexPath: "index/store.json",
+    chunk: { chunkSize: 1200, chunkOverlap: 200 },
   });
 }
 

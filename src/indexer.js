@@ -48,8 +48,23 @@
 import { loadAndChunkDocs } from "./loadDocs.js";
 import { embedTexts } from "./embed.js";
 import { LanceVectorStore } from "./vectorStore.js";
+import {
+  DEFAULT_MANIFEST_PATH,
+  loadManifest,
+  saveManifest,
+  computeChunkMeta,
+  diffManifests,
+} from "./recordManager.js";
 
+/**
+ * buildIndex()
+ * -----------
+ * mode:
+ * - "incremental" (default): only embed/add new chunks, delete removed chunks
+ * - "full": rebuild entire DB table from scratch
+ */
 export async function buildIndex({
+  mode = "incremental",
   dataDir = "data",
   exts = ["txt", "md"],
   chunk = { chunkSize: 1200, chunkOverlap: 200 },
@@ -60,11 +75,18 @@ export async function buildIndex({
   embedModel = process.env.RAG_EMBED_MODEL || "text-embedding-3-small",
   vectorColumn = process.env.RAG_VECTOR_COLUMN || "vector",
   ftsColumn = process.env.RAG_FTS_COLUMN || "content",
+  manifestPath = DEFAULT_MANIFEST_PATH,
 } = {}) {
-  logger.info?.("Indexing: loading + chunking docs...");
-  const chunks = await loadAndChunkDocs({ dataDir, exts, chunk });
-  logger.info?.(`Indexing: chunks = ${chunks.length}`);
+  logger.info?.(`Indexing started (mode=${mode})...`);
 
+  // 1) Load + chunk docs
+  const chunks = await loadAndChunkDocs({ dataDir, exts, chunk });
+  logger.info?.(`Chunks produced: ${chunks.length}`);
+
+  // 2) Compute chunk meta + stable IDs
+  const { items, idSet: currentIdsSet } = computeChunkMeta(chunks);
+
+  // 3) Init vector store
   const store = await LanceVectorStore.init({
     uri: lanceUri,
     tableName,
@@ -72,44 +94,103 @@ export async function buildIndex({
     ftsColumn,
   });
 
-  let created = false;
+  // FULL rebuild: embed all and overwrite table
+  if (mode === "full") {
+    logger.info?.("Full rebuild: embedding all chunks...");
+    const allRecords = [];
 
-  for (let i = 0; i < chunks.length; i += batchSize) {
-    const batch = chunks.slice(i, i + batchSize);
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize);
+      const vectors = await embedTexts(
+        batch.map((x) => x.content),
+        { model: embedModel }
+      );
+
+      const records = batch.map((x, idx) => ({
+        id: x.id,
+        citationId: x.citationId,
+        source: x.source,
+        chunkIndex: x.chunkIndex,
+        content: x.content,
+        contentHash: x.contentHash,
+        [vectorColumn]: vectors[idx],
+      }));
+
+      allRecords.push(...records);
+      logger.info?.(
+        `Embedded ${Math.min(i + batchSize, items.length)}/${items.length}`
+      );
+    }
+
+    await store.overwrite(allRecords);
+    await store.ensureIndexes();
+    await saveManifest(currentIdsSet, manifestPath);
+
+    logger.info?.("✅ Full rebuild complete.");
+    return {
+      mode,
+      chunksCount: chunks.length,
+      added: items.length,
+      deleted: 0,
+    };
+  }
+
+  // INCREMENTAL indexing: use manifest diff
+  const previousIdsSet = await loadManifest(manifestPath);
+  const { toAdd, toDelete } = diffManifests(previousIdsSet, currentIdsSet);
+
+  logger.info?.(
+    `Incremental plan: add=${toAdd.length}, delete=${toDelete.length}`
+  );
+
+  // 4) Delete removed chunks from DB
+  if (toDelete.length > 0) {
+    try {
+      await store.deleteByIds(toDelete);
+      logger.info?.(`Deleted ${toDelete.length} stale chunks from VectorDB`);
+    } catch (e) {
+      logger.warn?.(
+        "Delete failed (VectorDB version/predicate issue). Consider running mode=full reindex.",
+        { message: e?.message }
+      );
+    }
+  }
+
+  // 5) Add new/changed chunks
+  const addItems = items.filter((x) => toAdd.includes(x.id));
+
+  let added = 0;
+  for (let i = 0; i < addItems.length; i += batchSize) {
+    const batch = addItems.slice(i, i + batchSize);
     const vectors = await embedTexts(
-      batch.map((c) => c.content),
+      batch.map((x) => x.content),
       { model: embedModel }
     );
 
-    const records = batch.map((c, idx) => ({
-      id: c.id,
-      source: c.source,
-      chunkIndex: c.chunkIndex,
-      content: c.content,
+    const records = batch.map((x, idx) => ({
+      id: x.id,
+      citationId: x.citationId,
+      source: x.source,
+      chunkIndex: x.chunkIndex,
+      content: x.content,
+      contentHash: x.contentHash,
       [vectorColumn]: vectors[idx],
     }));
 
-    if (!created) {
-      logger.info?.("Indexing: creating table (overwrite)...");
-      await store.overwrite(records);
-      created = true;
-    } else {
-      await store.add(records);
-    }
+    await store.add(records);
+    added += records.length;
 
     logger.info?.(
-      `Indexing: embedded ${Math.min(i + batchSize, chunks.length)}/${
-        chunks.length
-      }`
+      `Added ${Math.min(i + batchSize, addItems.length)}/${addItems.length}`
     );
   }
 
-  // ✅ Build indexes: vector index + FTS(BM25) index
-  logger.info?.("Indexing: building vector + FTS indexes...");
+  // 6) Ensure indexes exist (best-effort)
   await store.ensureIndexes();
 
-  logger.info?.(
-    `Indexing: ✅ done. LanceDB uri=${lanceUri} table=${tableName}`
-  );
-  return { chunksCount: chunks.length };
+  // 7) Save manifest
+  await saveManifest(currentIdsSet, manifestPath);
+
+  logger.info?.("✅ Incremental indexing complete.");
+  return { mode, chunksCount: chunks.length, added, deleted: toDelete.length };
 }

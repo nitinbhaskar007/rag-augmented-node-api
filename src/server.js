@@ -180,10 +180,13 @@ async function main() {
    */
   app.post("/reindex", { preHandler: requireApiKey }, async (req, reply) => {
     try {
-      app.log.info("Reindex requested...");
-      await buildIndex({ logger: app.log });
+      const mode = req.body?.mode === "full" ? "full" : "incremental";
+
+      app.log.info(`Reindex requested (mode=${mode})...`);
+      const result = await buildIndex({ mode, logger: app.log });
+
       await engine.reloadStore();
-      return reply.send({ ok: true });
+      return reply.send({ ok: true, ...result });
     } catch (err) {
       req.log.error(err);
       return reply

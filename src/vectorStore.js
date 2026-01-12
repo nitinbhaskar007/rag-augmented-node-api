@@ -110,14 +110,12 @@ import * as lancedb from "@lancedb/lancedb";
 
 /**
  * LanceVectorStore
- * - Uses LanceDB as real VectorDB
+ * - Real VectorDB (LanceDB)
  * - Supports:
- *   1) Vector search
- *   2) Full-text search (BM25) via FTS index
- *   3) Hybrid search: Vector + FTS merged using RRF (in our code)
- *
- * Table schema we store:
- * { id, source, chunkIndex, content, vector }
+ *   - vector search
+ *   - BM25/FTS search
+ *   - hybrid fusion (RRF)
+ *   - incremental maintenance via deleteByIds()
  */
 export class LanceVectorStore {
   constructor({ uri, tableName, conn, table, vectorColumn, ftsColumn }) {
@@ -159,7 +157,6 @@ export class LanceVectorStore {
       await this.conn.dropTable(this.tableName);
     } catch {}
 
-    // Create new table
     this.table = await this.conn.createTable(this.tableName, records, {
       mode: "overwrite",
     });
@@ -179,25 +176,17 @@ export class LanceVectorStore {
     this.table = await this.conn.openTable(this.tableName);
   }
 
-  /**
-   * Ensure indexes exist:
-   * - Vector index on vector column (ANN)
-   * - FTS index (BM25) on content column
-   *
-   * We use createIndex + Index.fts() from LanceDB JS SDK. :contentReference[oaicite:4]{index=4}
-   */
   async ensureIndexes({
     vectorIndex = {
       numPartitions: 128,
       numSubVectors: 16,
       distanceType: "cosine",
     },
-    ftsIndex = {}, // add tokenizer options if needed
+    ftsIndex = {},
   } = {}) {
     if (!this.table)
       throw new Error(`LanceDB table not found: ${this.tableName}`);
 
-    // Vector index
     try {
       await this.table.createIndex(this.vectorColumn, {
         config: lancedb.Index.ivfPq({
@@ -206,47 +195,68 @@ export class LanceVectorStore {
           distanceType: vectorIndex.distanceType,
         }),
       });
-      // index name is `${column}_idx` in JS createIndex docs :contentReference[oaicite:5]{index=5}
       await this.table.waitForIndex(`${this.vectorColumn}_idx`);
-    } catch {
-      // ignore if already exists / cannot build right now
-    }
+    } catch {}
 
-    // FTS index (BM25)
     try {
       await this.table.createIndex(this.ftsColumn, {
         config: lancedb.Index.fts(ftsIndex),
       });
       await this.table.waitForIndex(`${this.ftsColumn}_idx`);
-    } catch {
-      // ignore if already exists / cannot build right now
-    }
+    } catch {}
   }
 
-  /* -------------------- Low-level searches -------------------- */
+  /**
+   * Delete by IDs (RecordManager uses this to remove stale chunks).
+   * LanceDB supports deletion via predicate string. We batch to keep predicate size sane.
+   *
+   * If deletion fails in your environment/version, fallback is to do a full rebuild.
+   */
+  async deleteByIds(ids, { batchSize = 200 } = {}) {
+    if (!this.table)
+      throw new Error(`LanceDB table not found: ${this.tableName}`);
+    if (!ids || ids.length === 0) return;
+
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batch = ids.slice(i, i + batchSize);
+      const escaped = batch
+        .map((x) => `'${String(x).replaceAll("'", "''")}'`)
+        .join(",");
+      const predicate = `id IN (${escaped})`;
+
+      // This is the typical LanceDB deletion API pattern.
+      await this.table.delete(predicate);
+    }
+  }
 
   async vectorSearch(queryVector, { topK = 8 } = {}) {
     if (!this.table)
       throw new Error(`LanceDB table not found: ${this.tableName}`);
 
     const rows = await this.table
-      .vectorSearch(queryVector) // vectorSearch exists :contentReference[oaicite:6]{index=6}
+      .vectorSearch(queryVector)
       .column(this.vectorColumn)
       .distanceType("cosine")
       .limit(topK)
-      .select(["id", "source", "chunkIndex", "content", this.vectorColumn])
+      .select([
+        "id",
+        "citationId",
+        "source",
+        "chunkIndex",
+        "content",
+        this.vectorColumn,
+      ])
       .toArray();
 
-    // Cosine distance: smaller is better; we convert to similarity-ish score
     return rows.map((r) => ({
       item: {
         id: r.id,
+        citationId: r.citationId ?? `${r.source}#${r.chunkIndex}`,
         source: r.source,
         chunkIndex: r.chunkIndex,
         content: r.content,
         embeddingUnit: r[this.vectorColumn],
       },
-      // if cosine distance = 1 - cosineSim, then sim = 1 - distance
       score: 1 - (r._distance ?? 1),
       _rankSource: "vector",
     }));
@@ -256,17 +266,23 @@ export class LanceVectorStore {
     if (!this.table)
       throw new Error(`LanceDB table not found: ${this.tableName}`);
 
-    // Table.search(query, queryType?, ftsColumns?) supports queryType "fts" and ftsColumns :contentReference[oaicite:7]{index=7}
     const rows = await this.table
       .search(queryText, "fts", [this.ftsColumn])
       .limit(topK)
-      .select(["id", "source", "chunkIndex", "content", this.vectorColumn])
+      .select([
+        "id",
+        "citationId",
+        "source",
+        "chunkIndex",
+        "content",
+        this.vectorColumn,
+      ])
       .toArray();
 
-    // FTS returns _score (BM25 relevance). Bigger is better.
     return rows.map((r) => ({
       item: {
         id: r.id,
+        citationId: r.citationId ?? `${r.source}#${r.chunkIndex}`,
         source: r.source,
         chunkIndex: r.chunkIndex,
         content: r.content,
@@ -277,20 +293,9 @@ export class LanceVectorStore {
     }));
   }
 
-  /* -------------------- Hybrid: RRF fusion -------------------- */
-
-  /**
-   * RRF fusion:
-   * score = Σ 1 / (K + rank)
-   * where rank starts at 1.
-   *
-   * K default=60 is the common near-optimal constant in RRF literature and also
-   * matches LanceDB’s RRF defaults conceptually. :contentReference[oaicite:8]{index=8}
-   */
   static rrfFuse(vectorHits, ftsHits, { K = 60 } = {}) {
     const out = new Map();
 
-    // 1) rank lists by "best first"
     const v = [...vectorHits].sort((a, b) => b.score - a.score);
     const f = [...ftsHits].sort((a, b) => b.score - a.score);
 
@@ -322,12 +327,6 @@ export class LanceVectorStore {
     return [...out.values()].sort((a, b) => b.score - a.score);
   }
 
-  /**
-   * Hybrid search for ONE query variant:
-   * - vectorSearch(embedding)
-   * - ftsSearch(text)
-   * - RRF fuse
-   */
   async hybridSearch(queryVector, queryText, { topK = 8, rrfK = 60 } = {}) {
     const [vHits, fHits] = await Promise.all([
       this.vectorSearch(queryVector, { topK }),
@@ -337,12 +336,6 @@ export class LanceVectorStore {
     return LanceVectorStore.rrfFuse(vHits, fHits, { K: rrfK }).slice(0, topK);
   }
 
-  /**
-   * Hybrid search for MULTIPLE query variants (multi-query + HyDE):
-   * - For each variant i:
-   *   - hybridSearch(variantEmbeds[i], variantTexts[i])
-   * - Then merge by chunk-id, keeping best score per chunk.
-   */
   async hybridSearchMulti(
     variantEmbeds,
     variantTexts,
@@ -351,10 +344,7 @@ export class LanceVectorStore {
     const best = new Map();
 
     for (let i = 0; i < variantEmbeds.length; i++) {
-      const qVec = variantEmbeds[i];
-      const qText = variantTexts[i];
-
-      const hits = await this.hybridSearch(qVec, qText, {
+      const hits = await this.hybridSearch(variantEmbeds[i], variantTexts[i], {
         topK: perQueryTopK,
         rrfK,
       });
