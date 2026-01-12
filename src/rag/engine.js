@@ -305,8 +305,9 @@ function pickDiverse(
 function buildContextBlock(selectedHits) {
   return selectedHits
     .map((h) => {
-      const { source, chunkIndex, content } = h.item;
-      return `[source: ${source}#${chunkIndex}]\n${content}`;
+      const citation =
+        h.item.citationId || `${h.item.source}#${h.item.chunkIndex}`;
+      return `[source: ${citation}]\n${h.item.content}`;
     })
     .join("\n\n---\n\n");
 }
